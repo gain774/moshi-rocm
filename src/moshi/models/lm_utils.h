@@ -21,14 +21,17 @@ struct moshi_scaled_embedding_demux_t {
 void get_weights( WeightLoader * loader, std::string path,
         moshi_scaled_embedding_demux_t * m ) {
     if ( loader->quantize ) {
-        if ( loader->qtype == GGML_TYPE_Q4_K ) {
-            auto n = loader->fetch( &m->weight, path + "weight", GGML_TYPE_Q4_0 );
+        // mixed-precision: embeddings use higher-precision fallback type
+        ggml_type emb_type = loader->quantize_mixed ? loader->qtype_fallback : loader->qtype;
+        if ( emb_type == GGML_TYPE_Q4_K || emb_type == GGML_TYPE_Q5_K || emb_type == GGML_TYPE_Q6_K || emb_type == GGML_TYPE_Q3_K ) {
+            // K-types may not work with get_rows on all backends; use Q8_0 for embeddings
+            auto n = loader->fetch( &m->weight, path + "weight", GGML_TYPE_Q8_0 );
             assert( n );
-        } else if ( loader->qtype == GGML_TYPE_Q8_K ) {
+        } else if ( emb_type == GGML_TYPE_Q8_K ) {
             auto n = loader->fetch( &m->weight, path + "weight", GGML_TYPE_Q8_0 );
             assert( n );
         } else {
-            auto n = loader->fetch( &m->weight, path + "weight", loader->qtype );
+            auto n = loader->fetch( &m->weight, path + "weight", emb_type );
             assert( n );
         }
     } else {
@@ -131,14 +134,16 @@ struct moshi_scaled_embedding_t {
 void get_weights( WeightLoader * loader, std::string path,
         moshi_scaled_embedding_t * m ) {
     if ( loader->quantize ) {
-        if ( loader->qtype == GGML_TYPE_Q4_K ) {
-            auto n = loader->fetch( &m->weight, path + "weight", GGML_TYPE_Q4_0 );
+        // mixed-precision: embeddings use higher-precision fallback type
+        ggml_type emb_type = loader->quantize_mixed ? loader->qtype_fallback : loader->qtype;
+        if ( emb_type == GGML_TYPE_Q4_K || emb_type == GGML_TYPE_Q5_K || emb_type == GGML_TYPE_Q6_K || emb_type == GGML_TYPE_Q3_K ) {
+            auto n = loader->fetch( &m->weight, path + "weight", GGML_TYPE_Q8_0 );
             assert( n );
-        } else if ( loader->qtype == GGML_TYPE_Q8_K ) {
+        } else if ( emb_type == GGML_TYPE_Q8_K ) {
             auto n = loader->fetch( &m->weight, path + "weight", GGML_TYPE_Q8_0 );
             assert( n );
         } else {
-            auto n = loader->fetch( &m->weight, path + "weight", loader->qtype );
+            auto n = loader->fetch( &m->weight, path + "weight", emb_type );
             assert( n );
         }
     } else {

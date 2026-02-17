@@ -35,7 +35,9 @@ class WeightLoader {
     std::vector<alloc_request_t> alloc_requests;
     std::vector<std::function<void(WeightLoader*)>> init_requests;
     bool quantize;
+    bool quantize_mixed;  // mixed-precision: keep embeddings at higher precision
     ggml_type qtype;
+    ggml_type qtype_fallback;  // higher-precision type for sensitive layers
 
     bool is_gguf;
     std::map<std::string,ggml_tensor*> tensors;
@@ -50,7 +52,9 @@ private:
         this->ctx = NULL;
         buffer = NULL;
         quantize = false;
+        quantize_mixed = false;
         qtype = GGML_TYPE_Q4_0;
+        qtype_fallback = GGML_TYPE_Q8_0;
         is_gguf = false;
     }
     WeightLoader(const char * filename, gguf_context * gguf, ggml_context * ctx, ScratchContext * scratch, ggml_backend * backend = NULL) {
@@ -62,7 +66,9 @@ private:
         this->ctx = ctx;
         buffer = NULL;
         quantize = false;
+        quantize_mixed = false;
         qtype = GGML_TYPE_Q4_0;
+        qtype_fallback = GGML_TYPE_Q8_0;
         is_gguf = true;
     }
 public:
@@ -159,9 +165,20 @@ public:
         ggml_type src_type = safetensor_get_type( safetensor->dtype );
         NE ne;
         int n_dims = safetensor_get_shape(safetensor, ne, offset);
+        // K-type quants require 256-element alignment, fall back gracefully
+        if ( dst_type == GGML_TYPE_Q6_K && ne[0] % 256 ) {
+            dst_type = GGML_TYPE_Q8_0;
+        }
+        if ( dst_type == GGML_TYPE_Q5_K && ne[0] % 256 ) {
+            dst_type = GGML_TYPE_Q4_0;
+        }
         if ( dst_type == GGML_TYPE_Q4_K && ne[0] % 256 ) {
             dst_type = GGML_TYPE_Q4_0;
         }
+        if ( dst_type == GGML_TYPE_Q3_K && ne[0] % 256 ) {
+            dst_type = GGML_TYPE_Q4_0;
+        }
+        // 0-type quants require 32-element alignment
         if ( dst_type == GGML_TYPE_Q4_0 && ne[0] % 32 ) {
             dst_type = src_type;
         }

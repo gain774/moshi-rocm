@@ -652,23 +652,51 @@ int moshi_lm_get_delay_steps( moshi_lm_t * lm ) {
 }
 
 bool moshi_lm_quantize( moshi_lm_t * lm, const char * quant ) {
-    uint32_t uquant = *(uint32_t*)quant;
+    // parse quant string — compare first 5 bytes for mixed types, 4 for standard
+    std::string q(quant);
     ggml_type qtype = (ggml_type)0;
-    switch (uquant) {
-        case 0x305f3471: // "q4_0"
-            qtype = GGML_TYPE_Q4_0;
-            break;
-        case 0x6b5f3471: // "q4_k"
-            qtype = GGML_TYPE_Q4_K;
-            break;
-        case 0x305f3871: // "q8_0"
-            qtype = GGML_TYPE_Q8_0;
-            break;
-        default:
-            return false;
+    bool mixed = false;
+
+    if ( q == "q3_k" ) {
+        qtype = GGML_TYPE_Q3_K;
+    } else if ( q == "q4_0" ) {
+        qtype = GGML_TYPE_Q4_0;
+    } else if ( q == "q4_k" ) {
+        qtype = GGML_TYPE_Q4_K;
+    } else if ( q == "q5_k" ) {
+        qtype = GGML_TYPE_Q5_K;
+    } else if ( q == "q6_k" ) {
+        qtype = GGML_TYPE_Q6_K;
+    } else if ( q == "q8_0" ) {
+        qtype = GGML_TYPE_Q8_0;
+    } else if ( q == "q3_k_m" ) {
+        // mixed: transformer linear layers at Q3_K, embeddings at Q5_K
+        qtype = GGML_TYPE_Q3_K;
+        mixed = true;
+    } else if ( q == "q4_k_m" ) {
+        // mixed: transformer linear layers at Q4_K, embeddings at Q8_0
+        qtype = GGML_TYPE_Q4_K;
+        mixed = true;
+    } else if ( q == "q5_k_m" ) {
+        // mixed: transformer linear layers at Q5_K, embeddings at Q8_0
+        qtype = GGML_TYPE_Q5_K;
+        mixed = true;
+    } else {
+        return false;
     }
+
     lm->weights->quantize = true;
     lm->weights->qtype = qtype;
+    lm->weights->quantize_mixed = mixed;
+
+    // set fallback type for sensitive layers in mixed mode
+    if ( mixed ) {
+        if ( qtype == GGML_TYPE_Q3_K ) {
+            lm->weights->qtype_fallback = GGML_TYPE_Q5_K;
+        } else {
+            lm->weights->qtype_fallback = GGML_TYPE_Q8_0;
+        }
+    }
     return true;
 }
 

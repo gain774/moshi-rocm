@@ -10,6 +10,7 @@ kyutai/
 *.so.*
 *.pdb
 build/
+build-vulkan/
 test
 bin/mimi-decode
 bin/mimi-echo

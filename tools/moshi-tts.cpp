@@ -32,7 +32,8 @@ option(s):
                                MODEL_CACHE environment variable, or program
                                directory, or working directory. by default is
                                'Codes4Fun/tts-1.6b-en_fr-GGUF'
-  -q QUANT, --quantize QUANT   convert weights to: q8_0, q4_0, q4_k
+  -q QUANT, --quantize QUANT   convert weights to: q8_0, q4_0, q4_k, q3_k,
+                               q5_k, q6_k, q3_k_m, q4_k_m, q5_k_m
   -g,       --gguf-caching     loads gguf if exists, saves gguf if it does not.
                                model is saved alongside the original
                                safetensors file.
@@ -98,6 +99,7 @@ void signal_handler(int dummy) {
 
 int main(int argc, char *argv[]) {
     signal(SIGINT, signal_handler);
+    setvbuf( stdout, NULL, _IONBF, 0 ); // disable stdout buffering
 
     const char * device = NULL;
     int n_threads = 0;
@@ -254,20 +256,7 @@ int main(int argc, char *argv[]) {
     // MARK: Validate Args
     /////////////////////////
 
-    if ( quant ) {
-        uint32_t uquant = *(uint32_t*)quant;
-        switch (uquant) {
-        case 0x305f3471: // "q4_0"
-            break;
-        case 0x6b5f3471: // "q4_k"
-            break;
-        case 0x305f3871: // "q8_0"
-            break;
-        default:
-            fprintf( stderr, "error: invalid quant %s\n", quant );
-            exit(-1);
-        }
-    }
+    // quant validation is done by moshi_lm_quantize()
 
     const char * ext = NULL;
     if ( output_filename ) {
@@ -569,7 +558,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("done preparing loads.\n");
+    printf("done preparing loads.\n"); fflush(stdout);
 
     ///////////////////////
     // MARK: Load / Read

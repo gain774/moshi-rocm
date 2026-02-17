@@ -455,20 +455,7 @@ int main(int argc, char *argv[]) {
     printf( "loading...\n" );
     auto load_start = ggml_time_ms();
 
-    if ( quant ) {
-        uint32_t uquant = *(uint32_t*)quant;
-        switch (uquant) {
-        case 0x305f3471: // "q4_0"
-            break;
-        case 0x6b5f3471: // "q4_k"
-            break;
-        case 0x305f3871: // "q8_0"
-            break;
-        default:
-            fprintf( stderr, "error: invalid quant %s\n", quant );
-            exit(-1);
-        }
-    }
+    // quant validation is done by moshi_lm_quantize()
 
     std::string model_gguf = "";
     if ( gguf_caching ) {

@@ -1,0 +1,76 @@
+name: Build (ROCm/HIP)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-rocm:
+    runs-on: ubuntu-latest
+    container:
+      image: rocm/dev-ubuntu-24.04:6.3-complete
+
+    strategy:
+      matrix:
+        gpu_target: [gfx1100]
+
+    steps:
+      - name: Checkout moshi-rocm
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y cmake build-essential git wget pkg-config \
+            libsdl2-dev
+
+      - name: Build SentencePiece
+        run: |
+          git clone --branch v0.2.0 --depth 1 https://github.com/google/sentencepiece /tmp/sentencepiece
+          cd /tmp/sentencepiece
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DSPM_ENABLE_SHARED=OFF
+          cmake --build . --parallel $(nproc)
+          cmake --install .
+
+      - name: Download FFmpeg
+        run: |
+          mkdir -p /opt/ffmpeg
+          wget -q https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl-shared.tar.xz -O /tmp/ffmpeg.tar.xz
+          tar xf /tmp/ffmpeg.tar.xz -C /opt/ffmpeg --strip-components=1
+
+      - name: Build ggml with HIP
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/ggml /tmp/ggml
+          cd /tmp/ggml
+          mkdir build-hip && cd build-hip
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/opt/rocm \
+            -DGGML_HIP=ON \
+            -DGPU_TARGETS=${{ matrix.gpu_target }} \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON
+          cmake --build . --parallel $(nproc)
+
+      - name: Build moshi-rocm
+        run: |
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_INCLUDE_DIR=/tmp/ggml/include \
+            -DGGML_LIBRARY_DIR=/tmp/ggml/build-hip/src \
+            -DSentencePiece_INCLUDE_DIR=/usr/local/include \
+            -DSentencePiece_LIBRARY_DIR=/usr/local/lib \
+            -DFFmpeg_DIR=/opt/ffmpeg
+          cmake --build . --parallel $(nproc)
+
+      - name: Copy libraries and verify
+        run: |
+          cp /tmp/ggml/build-hip/src/libggml*.so build/bin/ || true
+          cp /tmp/ggml/build-hip/src/ggml-hip/libggml-hip.so build/bin/ || true
+          ls -la build/bin/
+          echo "--- Shared library dependencies ---"
+          ldd build/bin/libmoshi.so || true

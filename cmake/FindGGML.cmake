@@ -81,7 +81,7 @@ find_package_handle_standard_args(GGML
 )
 
 # Mark the following variables as advanced so they don't show up in ccmake/cmake-gui by default.
-mark_as_advanced(GGML_INCLUDE_DIR GGML_LIBRARY GGML_CPU_LIBRARY GGML_CUDA_LIBRARY GGML_VULKAN_LIBRARY)
+mark_as_advanced(GGML_INCLUDE_DIR GGML_LIBRARY GGML_CPU_LIBRARY GGML_CUDA_LIBRARY GGML_VULKAN_LIBRARY GGML_HIP_LIBRARY)
 
 # Set the output variables for the user of this module.
 if(GGML_FOUND)

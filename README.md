@@ -1,3 +1,210 @@
+# moshi-rocm
+
+[moshi.cpp](https://github.com/Codes4Fun/moshi.cpp) の ROCm/HIP 移植版。
+AMD GPU 上で ggml の HIP バックエンドを使用して Moshi を実行する。
+
+Forked from: https://github.com/Codes4Fun/moshi.cpp
+
+---
+
+- [Architecture](#architecture)
+- [Requirements](#requirements)
+- [Quick Build (Script)](#quick-build-script)
+- [Manual Build](#manual-build)
+- [Running](#running)
+- [GPU Target Reference](#gpu-target-reference)
+- [Troubleshooting](#troubleshooting)
+- [Upstream README](#upstream-readme)
+
+## Architecture
+
+moshi.cpp は GPU 処理をすべて ggml バックエンド経由で行っており、CUDA 固有のコードは含まれていない。
+そのため ROCm 対応は以下の方針で実現する:
+
+1. **ggml を `-DGGML_HIP=ON` でビルド** → HIP バックエンド (`libggml-hip.so`) が生成される
+2. **moshi-rocm を HIP 対応 ggml にリンク** → FindGGML.cmake が `ggml-hip` ライブラリを自動検出
+3. **実行時に `-d HIP0` でデバイス指定** → AMD GPU 上で推論が走る
+
+## Requirements
+
+- **OS**: Linux (Ubuntu 22.04+ 推奨)
+- **ROCm**: 6.0 以上 (6.1.2+ 推奨、7.x は非推奨 — ggml との互換性問題あり)
+- **GPU**: RDNA 2/3 またはCDNA (gfx1030, gfx1100 など)
+- **CMake**: 3.14+
+- **C++ Compiler**: GCC 11+ または Clang 14+
+
+### Dependencies
+
+| Library | Notes |
+|---------|-------|
+| [ROCm](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/) | HIP runtime, hipBLAS, rocBLAS |
+| [ggml](https://github.com/ggml-org/ggml) | `-DGGML_HIP=ON` でビルド |
+| [SentencePiece](https://github.com/google/sentencepiece/releases/tag/v0.2.0) | v0.2.0、静的リンク推奨 |
+| [FFmpeg](https://github.com/BtbN/FFmpeg-Builds/releases) | 7+、`ffmpeg-master-latest-linux64-lgpl-shared` |
+| [SDL2](https://github.com/libsdl-org/SDL/releases/tag/release-2.30.11) | `sudo apt install libsdl2-dev` |
+
+## Quick Build (Script)
+
+```bash
+# ROCm のインストール (未導入の場合)
+# https://rocm.docs.amd.com/projects/install-on-linux/en/latest/
+
+# 依存ライブラリ
+sudo apt install cmake build-essential libsdl2-dev aria2
+
+# SentencePiece のビルド
+git clone --branch v0.2.0 --depth 1 https://github.com/google/sentencepiece
+cd sentencepiece && mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DSPM_ENABLE_SHARED=OFF
+cmake --build . --parallel $(nproc)
+sudo cmake --install .
+cd ../..
+
+# FFmpeg のダウンロード
+mkdir -p ~/lib && cd ~/lib
+wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl-shared.tar.xz
+tar xf ffmpeg-master-latest-linux64-lgpl-shared.tar.xz
+cd -
+
+# moshi-rocm のビルド (RDNA 3 の例)
+chmod +x scripts/build-rocm.sh
+./scripts/build-rocm.sh --gpu-targets gfx1100
+
+# RDNA 2 の場合
+# ./scripts/build-rocm.sh --gpu-targets gfx1030
+
+# 複数アーキテクチャ
+# ./scripts/build-rocm.sh --gpu-targets "gfx1100;gfx1030"
+```
+
+## Manual Build
+
+### Step 1: ggml を HIP 対応でビルド
+
+```bash
+git clone https://github.com/ggml-org/ggml
+cd ggml
+mkdir build-hip && cd build-hip
+
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH=/opt/rocm \
+    -DGGML_HIP=ON \
+    -DGPU_TARGETS=gfx1100 \
+    -DGGML_BACKEND_DL=ON \
+    -DGGML_CPU_ALL_VARIANTS=ON
+
+cmake --build . --parallel $(nproc)
+cd ../..
+```
+
+### Step 2: moshi-rocm をビルド
+
+```bash
+cd moshi-rocm
+mkdir build && cd build
+
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_INCLUDE_DIR=../../ggml/include \
+    -DGGML_LIBRARY_DIR=../../ggml/build-hip/src \
+    -DSentencePiece_INCLUDE_DIR=/usr/local/include \
+    -DSentencePiece_LIBRARY_DIR=/usr/local/lib \
+    -DFFmpeg_DIR=~/lib/ffmpeg-master-latest-linux64-lgpl-shared
+
+cmake --build . --parallel $(nproc)
+```
+
+### Step 3: ライブラリのコピー
+
+```bash
+# ggml ライブラリをバイナリディレクトリにコピー
+cp ../../ggml/build-hip/src/libggml*.so bin/
+cp ../../ggml/build-hip/src/ggml-hip/libggml-hip.so bin/
+
+# FFmpeg ライブラリ (必要な場合)
+cp ~/lib/ffmpeg-master-latest-linux64-lgpl-shared/lib/*.so* bin/
+```
+
+## Running
+
+### デバイスの確認
+
+```bash
+./bin/moshi-tts -l
+```
+
+HIP バックエンドが正しく読み込まれていれば、`HIP0` などの AMD GPU デバイスが表示される。
+
+### モデルのダウンロード
+
+```bash
+cd bin
+aria2c --disable-ipv6 -i moshi-defaults.txt
+```
+
+### 実行例
+
+```bash
+# Text-to-Speech (HIP デバイス指定)
+./bin/moshi-tts -d HIP0 "Hello World!"
+
+# Speech-to-Text
+./bin/moshi-stt -d HIP0
+
+# Speech-to-Speech (量子化でVRAM節約)
+./bin/moshi-sts -d HIP0 -g -q q4_k
+```
+
+## GPU Target Reference
+
+| Architecture | GPU Examples | Target |
+|-------------|-------------|--------|
+| RDNA 3 | RX 7900 XTX, RX 7800 XT, RX 7600 | gfx1100, gfx1101, gfx1102 |
+| RDNA 2 | RX 6900 XT, RX 6700 XT, RX 6600 | gfx1030, gfx1031, gfx1032 |
+| CDNA 3 | MI300X | gfx942 |
+| CDNA 2 | MI250X | gfx90a |
+
+自分の GPU のターゲットを確認:
+```bash
+rocminfo | grep "Name:" | grep "gfx"
+```
+
+## Troubleshooting
+
+### `hipcc` が見つからない
+```bash
+export PATH=/opt/rocm/bin:$PATH
+export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
+```
+
+### ROCm device library が見つからない
+```bash
+export HIP_DEVICE_LIB_PATH=/opt/rocm/amdgcn/bitcode
+```
+
+### HIP デバイスが `-l` に表示されない
+- `libggml-hip.so` が実行バイナリと同じディレクトリにあることを確認
+- `rocminfo` で GPU が認識されているか確認
+- ROCm のバージョンが 6.x 系であることを確認 (7.x は hipBLAS API の変更により非推奨)
+
+### ビルド時に hipblas.h が見つからない
+```bash
+sudo apt install hipblas-dev rocblas-dev
+```
+
+### 推論が遅い場合
+- `GGML_HIP_UMA=1` は iGPU 用。dGPU では設定しないこと
+- `-q q4_k` で量子化するとVRAM使用量が減り速度向上の場合あり
+- `GPU_TARGETS` が自分の GPU アーキテクチャと一致しているか確認
+
+---
+
+## Upstream README
+
+以下はフォーク元 (Codes4Fun/moshi.cpp) のオリジナルドキュメント。
+
+---
 
 # moshi.cpp
 
@@ -262,7 +469,7 @@ These are the available aria2 download scripts:
  * kyutai_stt-2.6b-en.txt - 6 GB, large model without vad but better quality.
  * kyutai_tts-0.75b-en-public.txt - 2 GB, small model that uses audio files for voices.
  * kyutai_tts-1.6b-en_fr.txt - downloaded as part of default.
- * kyutai_moshika-pytorch-bf16.txt - 16 GB female model 
+ * kyutai_moshika-pytorch-bf16.txt - 16 GB female model
  * kyutai_moshiko-pytorch-bf16.txt - 16 GB male model
 
 # Running Demos
@@ -345,27 +552,27 @@ Moshi operates at 12.5 frames per second, so anything below that would not work 
 CUDA benchmarks (beta2):
 | make   | name            | gb | driver | os    | tts fps | stt fps | sts q4_k |
 |--------|-----------------|----|--------|-------|---------|---------|----------|
-| NVIDIA | RTX 2070        |  8 | CUDA   | linux |   20.64 |   93.27 | 🟢 19.49 |
-| NVIDIA | RTX 4060        |  8 | CUDA   | linux |   19.41 |   76.63 | 🟢 17.85 |
-| NVIDIA | RTX 3060        | 12 | CUDA   | linux |   17.98 |   78.02 | 🟢 17.82 |
-| NVIDIA | RTX 2070 Laptop |  8 | CUDA   | linux |   18.84 |   83.08 | 🟢 16.89 |
-| NVIDIA | RTX 2070 Laptop |  8 | CUDA   | win10 |   16.96 |   59.56 | 🟢 14.75 |
-| NVIDIA | RTX 2070        |  8 | CUDA   | win11 |   14.71 |   48.46 | 🟢 13.77 |
-| NVIDIA | RTX 4060        |  8 | CUDA   | win11 |   14.14 |   42.37 | 🟢 13.44 |
-| NVIDIA | RTX 3060        | 12 | CUDA   | win11 |   13.80 |   42.44 | 🟢 12.79 |
-| NVIDIA | GTX 1070        |  8 | CUDA   | win11 |    8.72 |   41.81 | 🔴  6.94 |
+| NVIDIA | RTX 2070        |  8 | CUDA   | linux |   20.64 |   93.27 | 19.49 |
+| NVIDIA | RTX 4060        |  8 | CUDA   | linux |   19.41 |   76.63 | 17.85 |
+| NVIDIA | RTX 3060        | 12 | CUDA   | linux |   17.98 |   78.02 | 17.82 |
+| NVIDIA | RTX 2070 Laptop |  8 | CUDA   | linux |   18.84 |   83.08 | 16.89 |
+| NVIDIA | RTX 2070 Laptop |  8 | CUDA   | win10 |   16.96 |   59.56 | 14.75 |
+| NVIDIA | RTX 2070        |  8 | CUDA   | win11 |   14.71 |   48.46 | 13.77 |
+| NVIDIA | RTX 4060        |  8 | CUDA   | win11 |   14.14 |   42.37 | 13.44 |
+| NVIDIA | RTX 3060        | 12 | CUDA   | win11 |   13.80 |   42.44 | 12.79 |
+| NVIDIA | GTX 1070        |  8 | CUDA   | win11 |    8.72 |   41.81 |  6.94 |
 
 Vulkan benchmarks (beta2):
 | make   | name              | gb | driver | os    | tts fps | stt fps | sts q4_k |
 |--------|-------------------|----|--------|-------|---------|---------|----------|
-|  Intel | ARC B850          | 12 | Vulkan | win11 |   31.43 |   63.88 | 🟢 22.03 |
-|    AMD | Radeon RX 6700 XT | 12 | Vulkan | win11 |   22.46 |   56.70 | 🟢 19.17 |
-|    AMD | Radeon RX 6700 XT | 12 | Vulkan | linux |   20.35 |   58.32 | 🟢 17.84 |
-|  Intel | ARC B850          | 12 | Vulkan | linux |   19.88 |   44.49 | 🟢 16.45 |
-|    AMD | Radeon 8060S      | 64 | Vulkan | linux |   13.15 |   43.57 | 🟢 15.47 |
-|    AMD | Radeon 8060S      | 64 | Vulkan | win11 |   12.34 |   37.16 | 🟢 15.05 |
-|    AMD | Radeon 890M HX370 | 16 | Vulkan | linux |    7.50 |   23.83 | 🔴  6.60 |
-|    AMD | Radeon 890M HX370 | 16 | Vulkan | win11 |    7.53 |   21.65 | 🔴  5.80 |
+|  Intel | ARC B850          | 12 | Vulkan | win11 |   31.43 |   63.88 | 22.03 |
+|    AMD | Radeon RX 6700 XT | 12 | Vulkan | win11 |   22.46 |   56.70 | 19.17 |
+|    AMD | Radeon RX 6700 XT | 12 | Vulkan | linux |   20.35 |   58.32 | 17.84 |
+|  Intel | ARC B850          | 12 | Vulkan | linux |   19.88 |   44.49 | 16.45 |
+|    AMD | Radeon 8060S      | 64 | Vulkan | linux |   13.15 |   43.57 | 15.47 |
+|    AMD | Radeon 8060S      | 64 | Vulkan | win11 |   12.34 |   37.16 | 15.05 |
+|    AMD | Radeon 890M HX370 | 16 | Vulkan | linux |    7.50 |   23.83 |  6.60 |
+|    AMD | Radeon 890M HX370 | 16 | Vulkan | win11 |    7.53 |   21.65 |  5.80 |
 
 CPU benchmarks (alpha):
 | make  | name              | driver | tts fps | stt fps | threads |

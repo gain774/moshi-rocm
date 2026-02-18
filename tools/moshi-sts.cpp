@@ -3,12 +3,190 @@
 #include <string.h>
 #include <math.h>
 #include <assert.h>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <vector>
+#include <string>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#undef shutdown
+#endif
 
 #include "common_ggml.h"
 #include <moshi/moshi.h>
 #include "common_av.h"
 #include "common_sdl.h"
 #include "common_utils.h"
+
+static std::mutex translation_mutex;
+static std::condition_variable translation_cv;
+static std::vector<std::string> completed_translations;
+
+// User speech-to-text via Windows SAPI
+static std::vector<float> user_audio_buffer;
+static std::mutex stt_mutex;
+static std::vector<std::string> completed_stt;
+static bool model_was_speaking = false;
+
+static void save_wav(const char* filename, const float* data, int num_samples, int sample_rate) {
+    FILE* f = fopen(filename, "wb");
+    if (!f) return;
+    int16_t bits = 16, channels = 1, fmt = 1;
+    int32_t byte_rate = sample_rate * channels * (bits / 8);
+    int16_t block_align = channels * (bits / 8);
+    int32_t data_size = num_samples * channels * (bits / 8);
+    int32_t chunk_size = 36 + data_size;
+    fwrite("RIFF", 4, 1, f);
+    fwrite(&chunk_size, 4, 1, f);
+    fwrite("WAVE", 4, 1, f);
+    fwrite("fmt ", 4, 1, f);
+    int32_t fmt_size = 16;
+    fwrite(&fmt_size, 4, 1, f);
+    fwrite(&fmt, 2, 1, f);
+    fwrite(&channels, 2, 1, f);
+    fwrite(&sample_rate, 4, 1, f);
+    fwrite(&byte_rate, 4, 1, f);
+    fwrite(&block_align, 2, 1, f);
+    fwrite(&bits, 2, 1, f);
+    fwrite("data", 4, 1, f);
+    fwrite(&data_size, 4, 1, f);
+    for (int i = 0; i < num_samples; i++) {
+        float s = data[i];
+        if (s > 1.0f) s = 1.0f;
+        if (s < -1.0f) s = -1.0f;
+        int16_t sample = (int16_t)(s * 32767.0f);
+        fwrite(&sample, 2, 1, f);
+    }
+    fclose(f);
+}
+
+static void stt_worker(std::vector<float> audio) {
+    save_wav("_user_speech.wav", audio.data(), (int)audio.size(), 24000);
+    std::string cmd = "powershell -NoProfile -Command \""
+        "Add-Type -AssemblyName System.Speech; "
+        "$culture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US'); "
+        "$r = New-Object System.Speech.Recognition.SpeechRecognitionEngine($culture); "
+        "$r.SetInputToWaveFile('_user_speech.wav'); "
+        "$r.LoadGrammar(New-Object System.Speech.Recognition.DictationGrammar); "
+        "$result = $r.Recognize(); "
+        "if($result){$result.Text}\" 2>nul";
+    FILE* pipe = _popen(cmd.c_str(), "r");
+    if (!pipe) return;
+    std::string result;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), pipe)) {
+        result += buf;
+    }
+    _pclose(pipe);
+    while (result.size() && (result.back() == '\n' || result.back() == '\r'))
+        result.pop_back();
+    if (result.size()) {
+        std::lock_guard<std::mutex> lock(stt_mutex);
+        completed_stt.push_back(result);
+    }
+}
+
+static void flush_stt() {
+    std::lock_guard<std::mutex> lock(stt_mutex);
+    for (auto& t : completed_stt) {
+        fprintf(stdout, "[You: %s]\n", t.c_str());
+    }
+    completed_stt.clear();
+    fflush(stdout);
+}
+
+static std::string url_encode(const std::string& s) {
+    std::string result;
+    for (unsigned char c : s) {
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+            result += (char)c;
+        else if (c == ' ')
+            result += '+';
+        else {
+            char buf[4];
+            snprintf(buf, sizeof(buf), "%%%02X", c);
+            result += buf;
+        }
+    }
+    return result;
+}
+
+static std::string decode_unicode_escapes(const std::string& s) {
+    std::string result;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (i + 5 < s.size() && s[i] == '\\' && s[i+1] == 'u') {
+            unsigned int cp = 0;
+            if (sscanf(s.c_str() + i + 2, "%4x", &cp) == 1) {
+                if (cp < 0x80) {
+                    result += (char)cp;
+                } else if (cp < 0x800) {
+                    result += (char)(0xC0 | (cp >> 6));
+                    result += (char)(0x80 | (cp & 0x3F));
+                } else {
+                    result += (char)(0xE0 | (cp >> 12));
+                    result += (char)(0x80 | ((cp >> 6) & 0x3F));
+                    result += (char)(0x80 | (cp & 0x3F));
+                }
+                i += 5;
+                continue;
+            }
+        }
+        result += s[i];
+    }
+    return result;
+}
+
+static void translate_worker(std::string sentence) {
+    std::string encoded = url_encode(sentence);
+    std::string cmd = "curl -s \"https://api.mymemory.translated.net/get?q="
+        + encoded + "&langpair=en|ja\" 2>nul";
+    FILE* pipe = _popen(cmd.c_str(), "r");
+    if (!pipe) return;
+    std::string result;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), pipe)) {
+        result += buf;
+    }
+    _pclose(pipe);
+
+    auto pos = result.find("\"translatedText\":\"");
+    if (pos != std::string::npos) {
+        pos += 18;
+        auto end = result.find("\"", pos);
+        if (end != std::string::npos) {
+            std::string translation = result.substr(pos, end - pos);
+            translation = decode_unicode_escapes(translation);
+            {
+                std::lock_guard<std::mutex> lock(translation_mutex);
+                completed_translations.push_back(translation);
+            }
+            translation_cv.notify_one();
+        }
+    }
+}
+
+static void flush_translations() {
+    std::lock_guard<std::mutex> lock(translation_mutex);
+    for (auto& t : completed_translations) {
+        fprintf(stdout, "(%s)\n", t.c_str());
+    }
+    completed_translations.clear();
+    fflush(stdout);
+}
+
+// Wait up to timeout_ms for a translation to arrive, then flush
+static void flush_translations_wait(int timeout_ms) {
+    {
+        std::unique_lock<std::mutex> lock(translation_mutex);
+        if (completed_translations.empty()) {
+            translation_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                [] { return !completed_translations.empty(); });
+        }
+    }
+    flush_translations();
+}
 
 static void print_usage(const char * program) {
     fprintf( stderr, R"(usage: %s [option(s)]
@@ -65,6 +243,11 @@ personaplex options:
                                     VARM2
                                     VARM3
                                     VARM4
+  -p TEXT,  --prompt TEXT       text prompt for PersonaPlex system conditioning.
+                               examples:
+                                    "You are a wise and friendly teacher."
+                                    "You work for customer service."
+                                    "You enjoy having a good conversation."
 
 )", program);
     exit(1);
@@ -86,6 +269,10 @@ void signal_handler(int dummy) {
 }
 
 int main(int argc, char *argv[]) {
+    setvbuf( stdout, NULL, _IONBF, 0 ); // disable stdout buffering
+#ifdef _WIN32
+    SetConsoleOutputCP(65001); // UTF-8 output for Japanese translation
+#endif
     signal(SIGINT, signal_handler);
 
     const char * device = NULL;
@@ -109,6 +296,7 @@ int main(int argc, char *argv[]) {
     int input_delay = 0;
 
     std::string personaplex_voice_filepath = "";
+    const char * text_prompt = NULL;
 
     //////////////////////
     // MARK: Parse Args
@@ -219,6 +407,14 @@ int main(int argc, char *argv[]) {
                 exit(1);
             }
             personaplex_voice_filepath = argv[++i];
+            continue;
+        }
+        if (arg == "-p" || arg == "--prompt") {
+            if (i + 1 >= argc) {
+                fprintf( stderr, "error: \"%s\" requires text prompt\n", argv[i] );
+                exit(1);
+            }
+            text_prompt = argv[++i];
             continue;
         }
         if (arg[0] == '-') {
@@ -541,6 +737,9 @@ int main(int argc, char *argv[]) {
     if ( personaplex && personaplex_voice_filepath.size() ) {
         moshi_lm_personaplex_load_voice( moshi, gen, personaplex_voice_filepath.c_str() );
     }
+    if ( personaplex && text_prompt ) {
+        moshi_lm_personaplex_set_text_prompt( gen, tok, text_prompt );
+    }
 
     /////////////////////////
     // MARK: SDL
@@ -576,7 +775,7 @@ int main(int argc, char *argv[]) {
         assert( want.channels == have.channels );
         assert( want.samples == have.samples );
 
-        sdl_init_frames( output_state, 3, frame_size*4 );
+        sdl_init_frames( output_state, 20, frame_size*4 );
 
         want.callback = sdl_audio_callback;
         want.userdata = &output_state;
@@ -600,6 +799,7 @@ int main(int argc, char *argv[]) {
 
     std::vector<int16_t> tokens(num_codebooks);
     int text_token;
+    std::string sentence_buffer;
 
     std::vector<float> blank(frame_size);
 
@@ -658,6 +858,16 @@ int main(int argc, char *argv[]) {
             // sdl_receive_frame can block, don't include in frame rate
             sdl_frame_t * input_frame = sdl_receive_frame( input_state, true );
 
+            // Buffer user audio for STT
+            float * pcm = (float*)input_frame->data;
+            int n_samples = input_frame->nb_bytes / (int)sizeof(float);
+            user_audio_buffer.insert( user_audio_buffer.end(), pcm, pcm + n_samples );
+            // Cap buffer at 30 seconds (24000 * 30 = 720000 samples)
+            if ( user_audio_buffer.size() > 720000 ) {
+                user_audio_buffer.erase( user_audio_buffer.begin(),
+                    user_audio_buffer.begin() + (user_audio_buffer.size() - 720000) );
+            }
+
             lm_start = ggml_time_us();
             mimi_encode_send( encoder, (float*)input_frame->data );
             lm_delta_time += ggml_time_us() - lm_start;
@@ -692,6 +902,15 @@ int main(int argc, char *argv[]) {
 
             // text out
             if ( text_token != 0 && text_token != 3 /*&& text_token > 0*/ ) {
+                // Trigger user STT when model starts a new response
+                if ( ! model_was_speaking && user_audio_buffer.size() > 24000 ) {
+                    // Model just started speaking — transcribe user's audio in background
+                    auto audio_copy = user_audio_buffer;
+                    user_audio_buffer.clear();
+                    std::thread( stt_worker, std::move(audio_copy) ).detach();
+                }
+                model_was_speaking = true;
+
                 auto piece = tokenizer_id_to_piece( tok, text_token );
                 std::string _text;
                 for ( size_t ci = 0; ci < piece.size(); ci++ ) {
@@ -702,13 +921,44 @@ int main(int argc, char *argv[]) {
                     }
                     _text += piece[ci];
                 }
+                flush_stt();
+                flush_translations();
                 fprintf( stdout, "%s", _text.c_str() );
+                sentence_buffer += _text;
+                if ( _text.size() > 0 ) {
+                    char last = _text[ _text.size() - 1 ];
+                    if ( last == '.' || last == '!' || last == '?' ) {
+                        fprintf( stdout, "\n" );
+                        fflush( stdout );
+                        // Async translation with timed wait (max 1.5s)
+                        std::string to_translate = sentence_buffer;
+                        sentence_buffer.clear();
+                        std::thread( translate_worker, std::move(to_translate) ).detach();
+                        flush_translations_wait( 1500 );
+                    }
+                }
                 fflush( stdout );
+            } else {
+                // Not speaking — reset flag so next speech triggers STT
+                model_was_speaking = false;
             }
         }
     }
 
     log_metrics();
+
+    // Wait for pending translation threads to finish
+    if ( sentence_buffer.size() > 0 ) {
+        fprintf( stdout, "\n" );
+        translate_worker( sentence_buffer );
+    }
+#ifdef _WIN32
+    Sleep(3000);
+#else
+    usleep(3000000);
+#endif
+    flush_stt();
+    flush_translations();
 
     return 0;
 }

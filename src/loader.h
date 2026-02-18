@@ -252,32 +252,61 @@ public:
     bool load_gguf() {
 
         assert( backend );
+
+        // Convert bf16 tensors to f32 before allocation (bf16 unsupported on some backends)
+        for (auto tensor = ggml_get_first_tensor(ctx); tensor;
+                  tensor = ggml_get_next_tensor(ctx, tensor)) {
+            if (tensor->type == GGML_TYPE_BF16) {
+                tensor->type = GGML_TYPE_F32;
+                tensor->nb[0] = sizeof(float);
+                for (int i = 1; i < GGML_MAX_DIMS; i++) {
+                    tensor->nb[i] = tensor->nb[i-1] * tensor->ne[i-1];
+                }
+            }
+        }
+
         buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
 
         auto f = fopen( filename.c_str(), "rb" );
 
-        std::vector<char*> data;
+        std::vector<char> data;
+        std::vector<char> f32_data;
         auto data_offset = gguf_get_data_offset( gguf );
         int n_tensors = (int) gguf_get_n_tensors( gguf );
         for (int i = 0; i < n_tensors; i++) {
             std::string name = gguf_get_tensor_name( gguf, i );
             auto tensor      = ggml_get_tensor( ctx, name.c_str() );
             auto offset      = data_offset + gguf_get_tensor_offset( gguf, i );
-            auto nbytes      = gguf_get_tensor_size( gguf, i );
+            auto nbytes_disk = gguf_get_tensor_size( gguf, i );
+            auto nbytes_mem  = ggml_nbytes( tensor );
 
-            if ( data.size() < nbytes ) data.resize( nbytes );
+            if ( data.size() < nbytes_disk ) data.resize( nbytes_disk );
 #ifdef _WIN32
             auto e = _fseeki64(f, offset, SEEK_SET);
 #else
             auto e = fseek(f, offset, SEEK_SET);
 #endif
             assert( e == 0 );
-            int64_t r = fread(data.data(), nbytes, 1, f);
+            int64_t r = fread(data.data(), nbytes_disk, 1, f);
             if (r != 1) {
                 printf("failed to read tensor %s\n", name.c_str());
                 exit(-1);
             }
-            ggml_backend_tensor_set(tensor, data.data(), 0, nbytes);
+
+            if ( nbytes_disk != nbytes_mem ) {
+                // bf16 -> f32 conversion
+                if ( f32_data.size() < nbytes_mem ) f32_data.resize( nbytes_mem );
+                auto n_elements = ggml_nelements( tensor );
+                auto src = (uint16_t*)data.data();
+                auto dst = (float*)f32_data.data();
+                for (int64_t j = 0; j < n_elements; j++) {
+                    uint32_t val = (uint32_t)src[j] << 16;
+                    memcpy( &dst[j], &val, sizeof(float) );
+                }
+                ggml_backend_tensor_set(tensor, f32_data.data(), 0, nbytes_mem);
+            } else {
+                ggml_backend_tensor_set(tensor, data.data(), 0, nbytes_disk);
+            }
 
             tensors[name] = tensor;
         }

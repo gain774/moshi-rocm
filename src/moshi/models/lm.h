@@ -752,6 +752,7 @@ struct voice_t {
     // personaplex
     ggml_tensor * prompt_embeddings;
     ggml_tensor * prompt_cache;
+    std::vector<int> text_prompt_tokens;
 };
 
 struct moshi_lmgen_t {
@@ -1046,21 +1047,147 @@ void moshi_lmgen_step_voice_prompt(
 }
 
 void moshi_lmgen_step_text_prompt(
-    ScratchContext & ctx,
+    ScratchContext & scratch,
     moshi_lmgen_t * lmgen,
     moshi_lmgen_state_t * state,
     moshi_lmmodel_states_t * lm_states
 ) {
-    // TODO
+    auto lm = lmgen->lm;
+    auto use_sampling = lmgen->use_sampling;
+    auto temp = lmgen->temp;
+    auto temp_text = lmgen->temp_text;
+    auto top_k = lmgen->top_k;
+    auto top_k_text = lmgen->top_k_text;
+
+    // Get text prompt tokens from voice (set via moshi_lm_personaplex_set_text_prompt)
+    std::vector<int> * prompt_tokens = NULL;
+    if ( lmgen->text_prefixes ) {
+        // For TTS voice path (not used for personaplex)
+    }
+    // Check voice text_prompt_tokens via the lm_states route - we need to pass them in
+    // For now, use the tokens stored in the voice struct via system_prompts caller
+
+    // Build input sequence: text_token + SILENCE audio tokens
+    std::vector<int> int_audio_tokens( lm->dep_q );
+    const int CT = (int) state->cache.size();
+
+    // The text prompt tokens should have been set before calling this
+    // Access them through the voice struct via the caller (moshi_lmgen_step_system_prompts)
+    // This function receives tokens via the extended signature below
 }
 
+// Internal version with token list
+void moshi_lmgen_step_text_prompt_tokens(
+    ScratchContext & scratch,
+    moshi_lmgen_t * lmgen,
+    moshi_lmgen_state_t * state,
+    moshi_lmmodel_states_t * lm_states,
+    std::vector<int> & tokens
+) {
+    if ( tokens.empty() )
+        return;
+
+    auto lm = lmgen->lm;
+    auto use_sampling = lmgen->use_sampling;
+    auto temp = lmgen->temp;
+    auto temp_text = lmgen->temp_text;
+    auto top_k = lmgen->top_k;
+    auto top_k_text = lmgen->top_k_text;
+    std::vector<int> int_audio_tokens( lm->dep_q );
+    const int CT = (int) state->cache.size();
+
+    for ( int t = 0; t < (int)tokens.size(); t++ ) {
+        // Build input: text token from prompt, silence audio tokens
+        std::vector<int> input( lm->num_codebooks );
+        input[0] = tokens[t];
+        for ( int i = 0; i < (int)SILENCE_TOKENS.size() && i < lm->num_audio_codebooks; i++ ) {
+            input[i + lm->audio_offset] = SILENCE_TOKENS[i];
+        }
+
+        auto [scratch_transformer_out, text_logits] = moshi_lmmodel_forward_text(
+            scratch, lm, lm_states, input, NULL );
+
+        auto cpy_transformer_out = ggml_cpy( scratch,
+            scratch_transformer_out, lm_states->transformer_out );
+        scratch.build_forward_expand( cpy_transformer_out );
+
+        // Sample but override to padding token (model is being conditioned, not generating)
+        auto text_token = moshi_sample_token_int( scratch, text_logits,
+            use_sampling, temp_text, top_k_text );
+        text_token = 3; // force padding
+
+        moshi_lmmodel_depformer_step(
+            scratch, lm, lm_states,
+            text_token, use_sampling, temp, top_k,
+            int_audio_tokens );
+
+        int position = state->offset % CT;
+        state->cache[position][0] = text_token;
+        for ( int q = 0; q < (int)int_audio_tokens.size(); q++ ) {
+            state->cache[position][q + 1] = int_audio_tokens[q];
+        }
+        state->offset++;
+    }
+}
+
+void moshi_lmgen_step_audio_silence(
+    ScratchContext & scratch,
+    moshi_lmgen_t * lmgen,
+    moshi_lmgen_state_t * state,
+    moshi_lmmodel_states_t * lm_states,
+    int n_steps
+) {
+    auto lm = lmgen->lm;
+    auto use_sampling = lmgen->use_sampling;
+    auto temp = lmgen->temp;
+    auto temp_text = lmgen->temp_text;
+    auto top_k = lmgen->top_k;
+    auto top_k_text = lmgen->top_k_text;
+    std::vector<int> int_audio_tokens( lm->dep_q );
+    const int CT = (int) state->cache.size();
+
+    for ( int i = 0; i < n_steps; i++ ) {
+        // Build input: padding text token + silence audio tokens
+        std::vector<int> input( lm->num_codebooks );
+        input[0] = 3; // text padding token
+        for ( int j = 0; j < (int)SILENCE_TOKENS.size() && j < lm->num_audio_codebooks; j++ ) {
+            input[j + lm->audio_offset] = SILENCE_TOKENS[j];
+        }
+
+        auto [scratch_transformer_out, text_logits] = moshi_lmmodel_forward_text(
+            scratch, lm, lm_states, input, NULL );
+
+        auto cpy_transformer_out = ggml_cpy( scratch,
+            scratch_transformer_out, lm_states->transformer_out );
+        scratch.build_forward_expand( cpy_transformer_out );
+
+        auto text_token = moshi_sample_token_int( scratch, text_logits,
+            use_sampling, temp_text, top_k_text );
+        text_token = 3; // force padding
+
+        moshi_lmmodel_depformer_step(
+            scratch, lm, lm_states,
+            text_token, use_sampling, temp, top_k,
+            int_audio_tokens );
+
+        int position = state->offset % CT;
+        state->cache[position][0] = text_token;
+        for ( int q = 0; q < (int)int_audio_tokens.size(); q++ ) {
+            state->cache[position][q + 1] = int_audio_tokens[q];
+        }
+        state->offset++;
+    }
+}
+
+// Backward-compatible stub (0-arg silence does nothing)
 void moshi_lmgen_step_audio_silence(
     ScratchContext & ctx,
     moshi_lmgen_t * lmgen,
     moshi_lmgen_state_t * state,
     moshi_lmmodel_states_t * lm_states
 ) {
-    // TODO
+    // Default: 8 steps of silence (~0.64s at 12.5fps)
+    moshi_lmgen_step_audio_silence( ctx, lmgen, state, lm_states, 8 );
 }
 
 void moshi_lmgen_step_system_prompts(
@@ -1072,6 +1199,9 @@ void moshi_lmgen_step_system_prompts(
 ) {
     moshi_lmgen_step_voice_prompt( ctx, lmgen, state, lm_states, voice );
     moshi_lmgen_step_audio_silence( ctx, lmgen, state, lm_states );
-    moshi_lmgen_step_text_prompt( ctx, lmgen, state, lm_states );
+    if ( voice && voice->text_prompt_tokens.size() > 0 ) {
+        moshi_lmgen_step_text_prompt_tokens( ctx, lmgen, state, lm_states,
+            voice->text_prompt_tokens );
+    }
     moshi_lmgen_step_audio_silence( ctx, lmgen, state, lm_states );
 }

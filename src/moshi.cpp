@@ -844,6 +844,41 @@ int moshi_lm_personaplex_load_voice( moshi_context_t * moshi, moshi_lm_gen_t * g
     return 0;
 }
 
+void moshi_lm_personaplex_set_text_prompt( moshi_lm_gen_t * gen, tokenizer_t * tok, const char * text ) {
+    if ( ! gen->voice ) {
+        gen->voice = new voice_t{};
+        gen->voice->ctx = NULL;
+        gen->voice->buffer = NULL;
+        gen->voice->sum = NULL;
+        gen->voice->cross = NULL;
+        gen->voice->prompt_embeddings = NULL;
+        gen->voice->prompt_cache = NULL;
+    }
+    gen->voice->text_prompt_tokens.clear();
+    if ( ! text || ! text[0] )
+        return;
+
+    std::string prompt( text );
+    std::string ws = " \t\r\n";
+    auto cur = prompt.find_first_not_of(ws);
+    while (cur != std::string::npos) {
+        auto end = prompt.find_first_of(ws, cur);
+        std::string word;
+        if (end == std::string::npos) {
+            word = prompt.substr(cur);
+            cur = std::string::npos;
+        } else {
+            word = prompt.substr(cur, end - cur);
+            cur = prompt.find_first_not_of(ws, end);
+        }
+        std::vector<int> tokens;
+        tok->sp.Encode(word, &tokens);
+        for (auto t : tokens)
+            gen->voice->text_prompt_tokens.push_back(t);
+    }
+    printf("text prompt: %d tokens\n", (int)gen->voice->text_prompt_tokens.size());
+}
+
 void moshi_lm_start( moshi_context_t * moshi, moshi_lm_gen_t * gen, float depth_temperature, float text_temperature, bool logging ) {
     const int max_padding = 8;
     const int initial_padding = 2;
